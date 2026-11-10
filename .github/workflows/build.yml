@@ -1,0 +1,110 @@
+steps:
+  # Descarga el código fuente, incluyendo cualquier submódulo.
+  - name: Checkout repository
+    uses: actions/checkout@v4
+    with:
+      submodules: recursive
+
+  # Comprueba que el runner contiene una versión compatible de Xcode.
+  - name: Verify Xcode environment
+    shell: bash
+    run: |
+      set -euo pipefail
+      xcodebuild -version
+      xcrun --sdk iphoneos --show-sdk-version
+      uname -m
+
+  # xcodegen genera ios/Muguet.xcodeproj.
+  # binaryen proporciona wasm-opt para la optimización AOT opcional.
+  - name: Install system dependencies
+    shell: bash
+    run: |
+      set -euo pipefail
+      brew install xcodegen binaryen
+      xcodegen --version
+      wasm-opt --version
+
+  # Instala la versión exacta utilizada por make-ios.sh y el target físico de iOS.
+  - name: Configure Rust toolchain
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      if ! command -v rustup >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --profile minimal --no-modify-path
+      fi
+
+      echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      export PATH="${HOME}/.cargo/bin:${PATH}"
+
+      rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal
+      rustup target add "${RUST_TARGET}" --toolchain "${RUST_TOOLCHAIN}"
+      rustup default "${RUST_TOOLCHAIN}"
+
+      rustc "+${RUST_TOOLCHAIN}" --version
+      cargo "+${RUST_TOOLCHAIN}" --version
+      rustup target list --toolchain "${RUST_TOOLCHAIN}" --installed \
+        | grep -Fx "${RUST_TARGET}"
+
+  # Garantiza que ambos perfiles de firma contienen Increased Memory Limit.
+  # make-ios.sh --ipa utiliza específicamente Muguet-sideload.entitlements.
+  - name: Inject Increased Memory Limit entitlement
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      for plist in \
+        ios/Muguet.entitlements \
+        ios/Muguet-sideload.entitlements
+      do
+        test -f "${plist}"
+
+        /usr/libexec/PlistBuddy \
+          -c "Delete :com.apple.developer.kernel.increased-memory-limit" \
+          "${plist}" 2>/dev/null || true
+
+        /usr/libexec/PlistBuddy \
+          -c "Add :com.apple.developer.kernel.increased-memory-limit bool true" \
+          "${plist}"
+
+        plutil -lint "${plist}"
+        /usr/libexec/PlistBuddy \
+          -c "Print :com.apple.developer.kernel.increased-memory-limit" \
+          "${plist}"
+      done
+
+  # --ipa genera una IPA con firma ad hoc, preparada para ser
+  # resignada e instalada mediante AltStore u otra herramienta equivalente.
+  # Sin un game.zip, Muguet se compila sin incluir código propietario del juego.
+  - name: Build iOS IPA
+    shell: bash
+    env:
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+    run: |
+      set -euo pipefail
+      chmod +x ./make-ios.sh
+      ./make-ios.sh --ipa
+
+  # Verifica que el ZIP/IPA sea válido y que contenga el bundle esperado.
+  - name: Validate generated IPA
+    shell: bash
+    run: |
+      set -euo pipefail
+
+      test -s build/Muguet.ipa
+      unzip -tq build/Muguet.ipa
+      unzip -l build/Muguet.ipa | grep -F "Payload/Muguet.app/"
+
+      APP="target/ios-xcode/Build/Products/Release-iphoneos/Muguet.app"
+      test -d "${APP}"
+      codesign --verify --verbose=2 "${APP}"
+
+  # Publica la IPA para descargarla desde la ejecución del workflow.
+  - name: Upload IPA artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: Muguet-iOS-${{ github.run_number }}
+      path: build/Muguet.ipa
+      if-no-files-found: error
+      retention-days: 14
